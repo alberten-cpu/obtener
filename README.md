@@ -1,191 +1,173 @@
-# Obtener Stripe Connect Implementation Overview
+# Obtener — Stripe Connect Implementation Starter
 
-This document outlines how to implement Stripe Connect for **seller payouts**, **driver payouts**, commissions, delivery-fee allocation, and refund/reversal safety.
+This repository now contains a **practical starter plan** to implement Stripe Connect for both sellers and drivers, aligned to your confirmed payout model.
 
-## 1) Core Financial Rules (Server-Side Source of Truth)
+## What was done in this update
 
-Implement all money movement from a single backend payout logic layer:
+- Converted the previous high-level overview into a **“start now” execution guide**.
+- Added a **Week 1 implementation order** so engineering can begin immediately.
+- Added **concrete backend contracts** (DB fields + API endpoints + webhook handling sequence).
+- Added payout/refund rules with exact formulas and idempotency protections.
+- Added a clear **definition of done** and test checklist for go-live readiness.
 
-- **Product commission**: 5% of product subtotal **before GST**.
-- **Retailer payout**: `product_subtotal - (5% pre-GST commission)`.
-- **Driver payout**: fixed **$5** per completed order.
-- **Delivery fee**:
-  - Customer pays **$7**.
-  - **$5** to driver.
-  - **$2** retained by Obtener.
-- **Stripe processing fees**:
-  - Absorbed fully by Obtener.
-  - Never deducted from seller or driver transfer calculations.
+## Financial Rules (Locked)
 
-### Suggested Data Model Fields per Order
+All calculations must be done server-side from a single payout service.
 
-Store immutable money snapshots at payment time for auditability:
+- Product commission = **5% of pre-GST product subtotal**.
+- Retailer payout = `product_subtotal_ex_gst - commission`.
+- Driver payout = **$5.00** per completed order.
+- Delivery fee charged to customer = **$7.00**:
+  - Driver receives **$5.00**
+  - Obtener keeps **$2.00**
+- Stripe processing fees are absorbed by Obtener (never deducted from retailer/driver payouts).
+
+## How to Start (Implementation Order)
+
+### Step 1 — Stripe Platform Setup (Day 1)
+
+1. Enable Stripe Connect (Express) in platform account.
+2. Create environment variables:
+   - `STRIPE_SECRET_KEY`
+   - `STRIPE_WEBHOOK_SECRET`
+   - `STRIPE_CONNECT_REFRESH_URL`
+   - `STRIPE_CONNECT_RETURN_URL`
+3. Add webhook endpoint in Stripe dashboard for:
+   - **Endpoint URL (production):** `https://<your-backend-domain>/stripe/webhook`
+   - Example: `https://api.obtener.com/stripe/webhook`
+   - If your backend uses an `/api` prefix, use: `https://<your-backend-domain>/api/stripe/webhook`
+   - For local Stripe CLI testing: `http://localhost:<port>/stripe/webhook`
+   - `payment_intent.succeeded`
+   - `charge.refunded`
+   - `refund.updated`
+   - `account.updated`
+
+> Important: Use your **backend server URL** (not frontend URL) because Stripe must send events directly to your server webhook handler.
+
+### Step 2 — Database Financial Snapshot (Day 1–2)
+
+At order payment time, store immutable values:
 
 - `product_subtotal_ex_gst`
 - `gst_amount`
-- `delivery_fee_total` (= 700 cents)
-- `platform_commission_amount` (5% pre-GST)
+- `delivery_fee_total`
+- `platform_commission_amount`
 - `retailer_payout_amount`
-- `driver_payout_amount` (= 500 cents)
-- `platform_delivery_margin` (= 200 cents)
+- `driver_payout_amount`
+- `platform_delivery_margin`
 - `currency`
 - `payment_intent_id`
 - `seller_transfer_id` (nullable)
 - `driver_transfer_id` (nullable)
-- `refund_id` / `reversal_ids` (nullable)
-- `financial_status` (e.g. `paid`, `rejected_refunded`, `completed_paid_out`)
+- `refund_id` (nullable)
+- `seller_reversal_id` (nullable)
+- `driver_reversal_id` (nullable)
+- `financial_status`
 
-## 2) Stripe Account Setup
+### Step 3 — Seller Onboarding API (Day 2)
 
-### Stripe Connect Mode
-
-- Enable **Stripe Connect (Express)** on platform account.
-- Use destination account IDs for both:
-  - sellers (retailers)
-  - drivers
-
-### Recommended Stripe Objects
-
-- **Customer payment**: `PaymentIntent`.
-- **Payouts to connected accounts**: `Transfer` objects (created by your backend after business conditions are met).
-- **Refund on rejection**: `Refund` API against the payment.
-- **Edge-case rollback**: `Transfer Reversal` if a transfer already happened.
-
-## 3) Seller Onboarding Flow (Dashboard Trigger)
-
-1. Seller clicks **Connect Stripe** in Seller Dashboard.
-2. Backend creates or reuses Stripe `Account` (`type=express`).
-3. Backend generates an onboarding `account_link`.
-4. Frontend redirects seller to Stripe-hosted onboarding.
-5. On return + webhook (`account.updated`), backend checks:
-   - `charges_enabled`
-   - `payouts_enabled`
-   - requirements status
-6. Mark seller as **payout-ready** in DB.
-
-### API Endpoints (example)
+Implement:
 
 - `POST /api/seller/stripe/connect`
+  - create or reuse Stripe Express account
+  - generate account onboarding link
+  - return URL to frontend
 - `GET /api/seller/stripe/status`
-- `POST /webhooks/stripe`
+  - return `charges_enabled`, `payouts_enabled`, pending requirements
 
-## 4) Driver Onboarding Flow (App Trigger)
+Dashboard action:
 
-1. Driver signs up in mobile app.
-2. Driver taps **Set Up Payout Account**.
-3. Backend creates/reuses Express account for driver.
-4. Backend returns onboarding link; app opens in webview/external browser.
-5. Webhook and status check mark driver as **payout-ready**.
+- **Connect Stripe** button calls `/api/seller/stripe/connect` and redirects user.
 
-### API Endpoints (example)
+### Step 4 — Driver Onboarding API (Day 2–3)
+
+Implement:
 
 - `POST /api/driver/stripe/connect`
 - `GET /api/driver/stripe/status`
-- `POST /webhooks/stripe`
 
-## 5) Payment, Commission, and Payout Execution
+Driver app action:
 
-### At Checkout
+- **Set Up Payout Account** button opens onboarding URL in webview/browser.
 
-- Create `PaymentIntent` for full charge amount (products + GST + delivery).
-- Persist an order-level financial snapshot before capture/finalize.
+### Step 5 — Payout Engine (Day 3–5)
 
-### On Successful Payment
+On order completion only:
 
-- Set order to `paid`.
-- Do **not** transfer immediately unless order conditions are satisfied.
-
-### On Order Completion
-
-Run payout engine transactionally:
-
-1. Validate order eligible for payout and not refunded.
+1. Check order is paid, not refunded, not already transferred.
 2. Create seller transfer for `retailer_payout_amount`.
-3. Create driver transfer for fixed $5.
-4. Save transfer IDs and move order to payout-complete state.
-5. Ensure idempotency keys per payout action.
+3. Create driver transfer for `$5`.
+4. Save transfer IDs in DB.
+5. Mark `financial_status=completed_paid_out`.
 
-## 6) Rejection, Refund, and Reversal
+Idempotency requirements:
 
-### Rejected Before Payout
+- Use Stripe idempotency keys for every transfer/refund/reversal call.
+- Store processed webhook `event_id` and skip reprocessing.
 
-- Trigger full refund (`Refund` for total customer payment).
-- Mark order `rejected_refunded`.
-- Skip all transfer creation.
+### Step 6 — Rejection/Refund Handling (Day 5)
 
-### Rejected After Payout (Edge Case)
+- If order rejected before payout:
+  - create full refund to customer
+  - mark `financial_status=rejected_refunded`
+  - do not create transfers
+- If rejected after payout (edge case):
+  - refund customer fully
+  - reverse seller transfer
+  - reverse driver transfer
+  - store reversal IDs and reconciliation note
 
-- Trigger full customer refund.
-- Reverse seller transfer (full or calculated required amount).
-- Reverse driver transfer if already sent.
-- Record reversal IDs and reconciliation notes.
+## Payout Calculation Formula (Reference)
 
-## 7) Webhook & Idempotency Requirements
+Assume:
 
-Critical events to process:
+- product subtotal ex GST = `P`
+- commission = `0.05 * P`
+- retailer payout = `P - commission`
+- driver payout = `5.00`
+- platform delivery margin = `2.00`
 
-- `payment_intent.succeeded`
-- `charge.refunded` / `refund.updated`
-- `account.updated` (onboarding readiness)
+Then platform revenue for an order (excluding Stripe fees) is:
 
-Safety controls:
+- `commission + 2.00`
 
-- Verify Stripe signatures.
-- Idempotency table keyed by Stripe event ID.
-- Exactly-once payout guard (order-level lock/transaction).
-- Dead-letter/retry strategy for transient failures.
+## Webhook Processing Sequence
 
-## 8) Reconciliation & Audit Controls
+1. Verify Stripe signature.
+2. Check if event ID already processed.
+3. Process event atomically per order.
+4. Write ledger entry (charge/refund/transfer/reversal).
+5. Mark event as processed.
 
-Implement a ledger-style financial table (append-only preferred):
+## Definition of Done
 
-- entry type: charge / commission / transfer / refund / reversal
-- amount, currency, Stripe object IDs
-- order ID + actor ID (seller/driver)
-- timestamps + status
+Implementation is complete only when all are true:
 
-Build daily reconciliation job:
+- Seller onboarding works end-to-end and account becomes payout-enabled.
+- Driver onboarding works end-to-end and account becomes payout-enabled.
+- Completed order triggers exactly one seller transfer + one driver transfer.
+- Rejected order triggers full refund and no payout leakage.
+- Edge-case reversal works when payout happened before rejection.
+- Webhook replay does not duplicate financial movement.
+- Daily reconciliation report balances against Stripe data.
 
-- Compare internal ledger totals vs Stripe balance/transfer/refund data.
-- Flag mismatches for manual review.
+## Test Checklist
 
-## 9) Suggested Implementation Phases
+- Seller onboarding happy path + incomplete KYC path.
+- Driver onboarding happy path + incomplete KYC path.
+- Successful order payout math verification.
+- Rejected pre-payout full refund.
+- Rejected post-payout transfer reversal.
+- Duplicate webhook replay safety.
+- Concurrent completion requests do not double-pay.
 
-1. **Connect enablement + webhook skeleton**
-2. **Seller onboarding endpoints + dashboard wiring**
-3. **Driver onboarding endpoints + app wiring**
-4. **Payout engine with commission/delivery split rules**
-5. **Rejection refund + transfer reversal logic**
-6. **Reconciliation jobs + operational dashboards**
-7. **End-to-end Stripe test mode validation**
+## Delivery Estimate
 
-## 10) Testing Checklist
+- Connect setup/config: 3–4 days
+- Seller onboarding: 2–3 days
+- Driver onboarding: 2–3 days
+- Payout engine: 4–5 days
+- Refund/reversal: 3–4 days
+- QA + Stripe test mode: 3–4 days
 
-- Seller onboarding success/failure/requirements due.
-- Driver onboarding success/failure/requirements due.
-- Successful order:
-  - retailer gets full computed payout (no Stripe fee deduction)
-  - driver gets $5
-  - platform retains 5% pre-GST + $2 delivery margin
-- Rejected pre-payout => full refund + no transfers.
-- Rejected post-payout => full refund + transfer reversals.
-- Webhook replay/idempotency.
-- Concurrency test: duplicate completion events do not double-pay.
-
-## 11) Delivery Plan (Estimate)
-
-- Connect setup/configuration: **3–4 days**
-- Seller onboarding: **2–3 days**
-- Driver onboarding: **2–3 days**
-- Commission/payout engine: **4–5 days**
-- Refund/reversal handling: **3–4 days**
-- Stripe test mode + QA: **3–4 days**
-
-Expected timeline: **~4–5 weeks** including validation hardening.
-
-## 12) Key Risks / Dependencies
-
-- Connect capability and country KYC requirements.
-- Reliable webhook delivery + retry strategy.
-- Strict idempotency to prevent duplicate payouts.
-- Reconciliation confidence before production rollout.
+Total: ~4–5 weeks with validation.
